@@ -63,6 +63,7 @@
         --insecure      PORTAL_INSECURE      plain HTTP, LAN testing only
         --acme-cache    PORTAL_ACME_CACHE    acme/  (account and certificates)
         --email         PORTAL_EMAIL         contact for Let's Encrypt, optional
+        --acme-staging  PORTAL_ACME_STAGING  Let's Encrypt's test service, see below
         --web           PORTAL_WEB           serve the app from a directory
     -u, --url           PORTAL_HUB_URL       wss://127.0.0.1:8443
         --tls-cert      PORTAL_TLS_CERT      the bus certificate
@@ -99,5 +100,15 @@
        sudo cp deploy/portal.service /etc/systemd/system/
        sudo systemctl daemon-reload && sudo systemctl enable --now portal
 
-  The first visit to https://<domain> fetches the certificate; it renews
-  itself from then on.
+  ─── The certificate ───
+  portal asks Let's Encrypt for it at startup, and retries after 10 min,
+  20, … up to two hours apart until it has one; then it renews itself. A
+  visitor never starts an order: the internet's scanners find a new HTTPS
+  site within minutes, and Let's Encrypt allows a name five failed
+  validations an hour. Each failed check is logged with Let's Encrypt's own
+  reason ("Let's Encrypt says …").
+
+  To prove the setup without spending that allowance, run once with
+  PORTAL_ACME_STAGING=1: the test service has generous limits and issues a
+  certificate no browser trusts, kept apart in acme-staging/. When the log
+  says CERTIFICATE READY, remove the line and restart.

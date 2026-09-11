@@ -18,6 +18,7 @@ import (
 	log "log/slog"
 
 	cli "github.com/spf13/pflag"
+	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/MrZloHex/monolink"
@@ -56,6 +57,7 @@ func main() {
 	insecure := cli.Bool("insecure", env("PORTAL_INSECURE", "") != "", "Plain HTTP, for testing on the LAN only (env PORTAL_INSECURE)")
 	acmeCache := cli.String("acme-cache", env("PORTAL_ACME_CACHE", "acme"), "Where the Let's Encrypt account and certificates are kept (env PORTAL_ACME_CACHE)")
 	email := cli.String("email", env("PORTAL_EMAIL", ""), "Contact for Let's Encrypt, optional (env PORTAL_EMAIL)")
+	acmeStaging := cli.Bool("acme-staging", env("PORTAL_ACME_STAGING", "") != "", "Use Let's Encrypt's test service: generous limits, a certificate no browser trusts — for proving the setup (env PORTAL_ACME_STAGING)")
 	webDir := cli.String("web", env("PORTAL_WEB", ""), "Serve the app from this directory instead of the built-in copy (env PORTAL_WEB)")
 	maxSessions := cli.Int("max-sessions", 32, "Browsers connected at once")
 	hubURL := cli.StringP("url", "u", env("PORTAL_HUB_URL", "wss://127.0.0.1:8443"), "Hub URL (env PORTAL_HUB_URL)")
@@ -123,13 +125,26 @@ func main() {
 		log.Warn("PLAIN HTTP — for testing on the LAN only", "listen", *listen, "hub", *hubURL)
 		err = srv.ListenAndServe()
 	} else {
+		directory, cache := autocert.DefaultACMEDirectory, *acmeCache
+		if *acmeStaging {
+			directory = "https://acme-staging-v02.api.letsencrypt.org/directory"
+			cache += "-staging" // a test certificate must never be served as the real one
+			log.Warn("TEST CERTIFICATES from Let's Encrypt staging: no browser will trust them")
+		}
 		m := &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
 			HostPolicy: autocert.HostWhitelist(*domain),
-			Cache:      autocert.DirCache(*acmeCache),
+			Cache:      autocert.DirCache(cache),
 			Email:      *email,
+			Client: &acme.Client{
+				DirectoryURL: directory,
+				HTTPClient:   &http.Client{Transport: problems{http.DefaultTransport}, Timeout: time.Minute},
+			},
 		}
+		c := &certs{get: m, domain: *domain}
 		srv.TLSConfig = m.TLSConfig()
+		srv.TLSConfig.GetCertificate = c.GetCertificate
+		go c.obtain(ctx)
 		// Port 80 answers Let's Encrypt's challenges and sends everyone else
 		// to https. The certificate itself is obtained on 443 as well.
 		go func() {
