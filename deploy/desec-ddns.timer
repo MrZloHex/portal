@@ -1,0 +1,9 @@
+[Unit]
+Description=Every five minutes, keep the bubble's name on the current IP
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
