@@ -133,11 +133,16 @@ type session struct {
 	filled  time.Time
 }
 
+// inboxSize is how many frames from the bus may wait for one browser.
+const inboxSize = 1024
+
 func (s *session) run(ctx context.Context) {
 	defer s.ws.Close()
+	// Frames are taken from the inbox, in the order the hub sent them, not
+	// through a handler: monolink runs each handler on its own goroutine,
+	// so two PUBs of one value could reach the browser swapped.
 	s.bus = monolink.New(Panel, s.p.opt.HubURL,
-		append([]monolink.Option{monolink.WithDialect(monolink.V2), monolink.WithReconnect(0)}, s.p.opt.Dial...)...)
-	s.bus.Handle("*", s.fromBus)
+		append([]monolink.Option{monolink.WithDialect(monolink.V2), monolink.WithReconnect(0), monolink.WithInbox(inboxSize)}, s.p.opt.Dial...)...)
 	if err := s.bus.Connect(ctx); err != nil {
 		slog.Warn("bus unreachable", "err", err)
 		s.ws.WriteControl(websocket.CloseMessage,
@@ -146,6 +151,12 @@ func (s *session) run(ctx context.Context) {
 		return
 	}
 	defer s.bus.Close()
+	inbox := s.bus.Inbox() // taken here: Close clears the field it lives in
+	go func() {
+		for m := range inbox { // ends when Close closes it
+			s.fromBus(m)
+		}
+	}()
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -312,8 +323,7 @@ func (s *session) answer(m monolink.Message, verb, noun string, args ...string) 
 
 // ─── bus to browser ──────────────────────────────────────────────────
 
-func (s *session) fromBus(req *monolink.Request) {
-	m := req.Msg
+func (s *session) fromBus(m monolink.Message) {
 	if m.Version != monolink.V2 {
 		return
 	}

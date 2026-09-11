@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -344,6 +345,36 @@ func TestBrowserCannotChooseWhoItIs(t *testing.T) {
 		}
 	}
 	b.waitFrame(t, func(f string) bool { return strings.Contains(f, ":MONOWEB.dasha:VERTEX:SET:LAMP.STATE:OFF") })
+}
+
+// A node's frames reach the browser in the order it sent them: two PUBs of
+// one value arriving swapped would show the lamp on when it is off.
+func TestFramesReachTheBrowserInOrder(t *testing.T) {
+	b := newBus(t)
+	fakeMarshal(t, b)
+	c := b.node(t, "VERTEX")
+	n := monolink.NewNode(c, monolink.NodeInfo{Class: monolink.ClassLeaf, Product: "vertex", Version: "test"})
+	count := n.Prop("COUNT", monolink.Int(0, 1000), "a counter")
+	if err := c.Connect(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	br := connect(t, openPortal(t, b))
+	br.signIn("dasha", secret)
+
+	const sent = 300
+	go func() {
+		for i := 1; i <= sent; i++ {
+			count.Set(strconv.Itoa(i))
+		}
+	}()
+	for last := 0; last < sent; {
+		m := br.expect(func(m monolink.Message) bool { return m.Verb == monolink.VerbPub && m.Noun == "COUNT" })
+		v, _ := strconv.Atoi(m.Arg(0))
+		if v != last+1 {
+			t.Fatalf("after COUNT=%d the browser was given COUNT=%d", last, v)
+		}
+		last = v
+	}
 }
 
 // Two browsers asking with the same id: each hears only its own answer —
