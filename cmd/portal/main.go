@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
@@ -92,6 +93,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	mime.AddExtensionType(".webmanifest", "application/manifest+json")
 	app, err := fs.Sub(web.FS, "dist")
 	if err != nil {
 		log.Error("built-in app missing", "err", err)
@@ -148,11 +150,13 @@ func main() {
 
 // headers adds what every response from a door to the internet should
 // carry: nothing framed, nothing sniffed, no referrer, scripts and sockets
-// from here only — and, over TLS, HSTS.
+// from here only — and, over TLS, HSTS. 'wasm-unsafe-eval' lets the app
+// compile WebAssembly, where it runs argon2id to sign in; it allows no
+// JavaScript eval.
 func headers(next http.Handler, tls bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
-		h.Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'")
+		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'")
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Frame-Options", "DENY")
