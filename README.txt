@@ -16,10 +16,14 @@
 
   ▪ Portal writes the sender: MONOWEB until someone signs in,
     MONOWEB.<person> after. A browser cannot say it is anyone else.
-  ▪ Until then only marshal's sign-in passes — AUTH:USER, AUTH:PROOF,
-    SET:SESSION. The first person enrols at home, never over the internet.
+  ▪ Until then only marshal's sign-in passes — AUTH:CHALLENGE,
+    AUTH:PASSKEY, AUTH:REDEEM, SET:SESSION. The first person enrols at
+    home, never over the internet, and a browser signs in with a passkey
+    only: never AUTH:ENROL, never a panel's AUTH:KEY.
   ▪ After, everything is checked against the person's grants, and enforced
-    here rather than advised.
+    here rather than advised — and again at the hub: portal shows it the
+    ticket marshal signs for the session, renews it every four minutes,
+    and takes it off when the person signs out (SECURITY.txt §5).
   ▪ A browser hears the answers to its own requests and the announcements
     of what its person may read. Nothing else.
   ▪ Every request it forwards gets a random id of portal's, so two
@@ -34,9 +38,9 @@
 
     wss://<domain>/bus      one monolink v2 frame per message
 
-  Exactly as on the bus. A browser signs in with the same challenge as any
-  panel (marshal's README), proving its secret for the panel MONOWEB. Its
-  own ids come back on the answers; the sender it writes is ignored.
+  Exactly as on the bus. A browser signs in with a passkey, answering
+  marshal's challenge to the panel MONOWEB (marshal's README). Its own ids
+  come back on the answers; the sender it writes is ignored.
 
 
   ───────────────────────────────────────────────────────────────
@@ -45,9 +49,10 @@
     go build -o bin/portal ./cmd/portal
     go test ./...
 
-  On the LAN, in plain HTTP, to try it:
+  In plain HTTP, to try it — on this machine alone unless told otherwise:
 
-    ./bin/portal --insecure            # http://192.168.0.69:8080
+    ./bin/portal --insecure                                  # http://127.0.0.1:8080
+    ./bin/portal --insecure --listen 192.168.0.42:8080       # the LAN too
 
   The app is built into the binary from web/dist/. monoweb's build writes
   it there; --web <dir> serves a directory instead, for working on the app.
@@ -59,8 +64,8 @@
   Flags, with .env in the working directory supplying defaults:
 
         --domain        PORTAL_DOMAIN        the public name, e.g. home.example.org
-        --listen        PORTAL_LISTEN        :443  (:8080 with --insecure)
-        --insecure      PORTAL_INSECURE      plain HTTP, LAN testing only
+        --listen        PORTAL_LISTEN        :443  (127.0.0.1:8080 with --insecure)
+        --insecure      PORTAL_INSECURE      plain HTTP, testing only (true/false)
         --acme-cache    PORTAL_ACME_CACHE    acme/  (account and certificates)
         --email         PORTAL_EMAIL         contact for Let's Encrypt, optional
         --acme-staging  PORTAL_ACME_STAGING  Let's Encrypt's test service, see below
@@ -68,37 +73,30 @@
     -u, --url           PORTAL_HUB_URL       wss://127.0.0.1:8443
         --tls-cert      PORTAL_TLS_CERT      the bus certificate
         --tls-key       PORTAL_TLS_KEY
-        --tls-ca        PORTAL_TLS_CA
+        --tls-ca        PORTAL_TLS_CA        the bubble CA
         --max-sessions                       32
     -l, --log           PORTAL_LOG           info
 
-  On the server:
+  It does not start without all three bus TLS files and a wss:// hub URL.
 
-    PORTAL_DOMAIN=home.example.org
-    PORTAL_HUB_URL=wss://127.0.0.1:8443
-    PORTAL_TLS_CERT=../pki/portal/portal.cert.pem
-    PORTAL_TLS_KEY=../pki/portal/portal.key.pem
-    PORTAL_TLS_CA=../pki/intermediate/certs/ca-chain.cert.pem
+  ─── Strangers ───
+  A browser nobody signs in on is closed after two minutes; the app
+  reconnects by itself. From one internet address: eight sockets at once,
+  ten sign-in challenges and then ten a minute, five tries at an
+  invitation and then one every three minutes. The home network, the
+  tunnel and the machine itself are not rationed — a router looping the
+  household's phones back in shows them all as one address.
 
 
   ───────────────────────────────────────────────────────────────
   ▓ DEPLOY
 
-  1. A bus certificate:   cd ~/Projects/monolith/pki && bash issue.sh portal
-  2. .env as above, then  go build -o bin/portal ./cmd/portal
-  3. The router forwards TCP 443 and 80 to 192.168.0.69. 80 serves only
-     Let's Encrypt's renewals and a redirect to https.
-  4. DNS at deSEC, kept on the dynamic IP by deploy/desec-ddns.*:
-
-       sudo install -m 600 /dev/null /etc/desec-ddns.env
-       # DESEC_DOMAIN=example.org  DESEC_HOST=home.example.org  DESEC_TOKEN=…
-       sudo cp deploy/desec-ddns.service deploy/desec-ddns.timer /etc/systemd/system/
-       sudo systemctl enable --now desec-ddns.timer
-
-  5. portal itself. The unit lets it bind 443 and 80 without root:
-
-       sudo cp deploy/portal.service /etc/systemd/system/
-       sudo systemctl daemon-reload && sudo systemctl enable --now portal
+  Through deploy/'s monolithctl, with MONOLITH's release: its own user, a
+  sandboxed unit that may bind 443 and 80 and nothing more, its key sealed
+  (deploy/README.txt). The router forwards TCP 443 and 80 to the server;
+  80 serves only Let's Encrypt's renewals and a redirect to https. The
+  name stays on the dynamic IP by monolithctl's DDNS, with a deSEC token
+  restricted to that one record (deploy/README.txt).
 
   ─── The certificate ───
   portal asks Let's Encrypt for it at startup, and retries after 10 min,

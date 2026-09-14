@@ -8,9 +8,12 @@
 //   - Each browser gets a bus connection of its own, as MONOWEB, and portal
 //     writes the sender: MONOWEB until someone signs in, MONOWEB.<person>
 //     after. A browser cannot say it is anyone else.
-//   - Until then it may only sign in. After, everything it sends is checked
+//   - Until then it may only sign in, with a passkey, or take up an
+//     invitation. After, everything it sends is checked
 //     against the person's grants, here — enforced, not advised (SPEC §24),
-//     because the internet is not the household.
+//     because the internet is not the household — and again at the hub,
+//     which holds the connection to the ticket marshal signed for the
+//     session (SECURITY.txt §5).
 //   - It hears only the answers to its own requests, and the announcements
 //     of what its person may read. Nobody else's traffic.
 package portal
@@ -20,8 +23,10 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -34,8 +39,8 @@ import (
 	"github.com/MrZloHex/monolink/marshal"
 )
 
-// Panel is the node every browser speaks as. A browser signing in proves
-// its secret for this panel: marshal.Proof(verifier, name, Panel, nonce).
+// Panel is the node every browser speaks as. The challenges a browser's
+// passkey answers are marshal's to this panel.
 const Panel = "MONOWEB"
 
 const (
@@ -43,10 +48,23 @@ const (
 	readTimeout  = 2 * pingEvery
 	writeTimeout = 5 * time.Second
 	pendingTTL   = time.Minute     // an unanswered request is forgotten after this
-	grantsEvery  = 5 * time.Minute // how often a signed-in session re-reads its grants
+	ticketEvery  = 4 * time.Minute // how often a signed-in session renews its ticket; one lasts ten
 	askTimeout   = 5 * time.Second
 	rateBurst    = 40 // frames a browser may send at once
 	ratePerSec   = 20 // and then per second
+
+	// Each browser is a socket anyone may open, so what is rationed per
+	// socket alone is not rationed: signing in and taking up invitations are
+	// rationed per internet address too. A stranger may try a few; not fill
+	// marshal's challenges, lock its invitations, or take every socket.
+	signInWithin    = 2 * time.Minute // a socket nobody signs in on is closed after this
+	maxPerAddress   = 8               // sockets from one internet address at once
+	challengeBurst  = 10              // AUTH:CHALLENGE from one address at once
+	challengePerSec = 1.0 / 6         // and then ten a minute
+	redeemBurst     = 5               // AUTH:REDEEM from one address at once
+	redeemPerSec    = 1.0 / 180       // and then one every three minutes
+	maxVisitors     = 4096            // addresses remembered
+	visitorTTL      = 30 * time.Minute
 )
 
 // Options configures a Portal.
@@ -63,13 +81,84 @@ type Portal struct {
 
 	mu       sync.Mutex
 	sessions int
+	visitors map[string]*visitor // by visitorKey
+}
+
+// visitor is one internet address, and what it may still try.
+type visitor struct {
+	sockets    int
+	seen       time.Time // when its last socket closed
+	challenges bucket
+	redeems    bucket
+}
+
+// bucket is an allowance that refills: burst at once, then perSec.
+type bucket struct {
+	left float64
+	at   time.Time
+}
+
+func (b *bucket) take(now time.Time, burst, perSec float64) bool {
+	if b.at.IsZero() {
+		b.left = burst
+	} else {
+		b.left = min(burst, b.left+now.Sub(b.at).Seconds()*perSec)
+	}
+	b.at = now
+	if b.left < 1 {
+		return false
+	}
+	b.left--
+	return true
+}
+
+// visitorKey is whom r comes from, as rationing counts: its address, or for
+// IPv6 its /64, which one household — or one attacker — holds whole. "" for
+// the home network, the tunnel and the machine itself, which are not
+// rationed: a router looping the household's phones back in from the LAN
+// shows them all as one address.
+func visitorKey(r *http.Request) string {
+	ap, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	a := ap.Addr().Unmap()
+	if a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() {
+		return ""
+	}
+	if a.Is6() {
+		p, _ := a.Prefix(64)
+		return p.String()
+	}
+	return a.String()
+}
+
+// visitor is key's, made if need be; nil when too many are remembered. Call
+// with mu held.
+func (p *Portal) visitor(key string, now time.Time) *visitor {
+	if v := p.visitors[key]; v != nil {
+		return v
+	}
+	if len(p.visitors) >= maxVisitors {
+		for k, v := range p.visitors {
+			if v.sockets == 0 && now.Sub(v.seen) > visitorTTL {
+				delete(p.visitors, k)
+			}
+		}
+		if len(p.visitors) >= maxVisitors {
+			return nil
+		}
+	}
+	v := &visitor{}
+	p.visitors[key] = v
+	return v
 }
 
 func New(opt Options) *Portal {
 	if opt.MaxSessions <= 0 {
 		opt.MaxSessions = 32
 	}
-	p := &Portal{opt: opt}
+	p := &Portal{opt: opt, visitors: map[string]*visitor{}}
 	p.up = websocket.Upgrader{CheckOrigin: sameOrigin}
 	return p
 }
@@ -87,10 +176,19 @@ func sameOrigin(r *http.Request) bool {
 
 // ServeBus turns a browser's request into a session on the bus.
 func (p *Portal) ServeBus(w http.ResponseWriter, r *http.Request) {
+	key := visitorKey(r)
 	p.mu.Lock()
+	var v *visitor
 	full := p.sessions >= p.opt.MaxSessions
+	if !full && key != "" {
+		v = p.visitor(key, time.Now())
+		full = v == nil || v.sockets >= maxPerAddress
+	}
 	if !full {
 		p.sessions++
+		if v != nil {
+			v.sockets++
+		}
 	}
 	p.mu.Unlock()
 	if full {
@@ -100,6 +198,10 @@ func (p *Portal) ServeBus(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		p.mu.Lock()
 		p.sessions--
+		if v != nil {
+			v.sockets--
+			v.seen = time.Now()
+		}
 		p.mu.Unlock()
 	}()
 
@@ -107,7 +209,8 @@ func (p *Portal) ServeBus(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	s := &session{p: p, ws: ws, pending: map[string]pending{}, tokens: rateBurst, filled: time.Now()}
+	now := time.Now()
+	s := &session{p: p, ws: ws, from: v, pending: map[string]pending{}, tokens: rateBurst, filled: now, anonSince: now}
 	s.run(r.Context())
 }
 
@@ -120,17 +223,21 @@ type pending struct {
 }
 
 type session struct {
-	p   *Portal
-	ws  *websocket.Conn
-	wmu sync.Mutex
-	bus *monolink.Client
+	p    *Portal
+	ws   *websocket.Conn
+	wmu  sync.Mutex
+	bus  *monolink.Client
+	from *visitor // nil from the home network
 
-	mu      sync.Mutex
-	user    string
-	grants  []string
-	pending map[string]pending // by the id portal gave the request on the bus
-	tokens  float64
-	filled  time.Time
+	mu        sync.Mutex
+	user      string
+	grants    []string
+	token     string             // the person's session, kept to renew the ticket
+	until     time.Time          // when the ticket at the hub runs out
+	anonSince time.Time          // when nobody was last signed in here
+	pending   map[string]pending // by the id portal gave the request on the bus
+	tokens    float64
+	filled    time.Time
 }
 
 // inboxSize is how many frames from the bus may wait for one browser.
@@ -151,7 +258,7 @@ func (s *session) run(ctx context.Context) {
 		return
 	}
 	defer s.bus.Close()
-	inbox := s.bus.Inbox() // taken here: Close clears the field it lives in
+	inbox := s.bus.Inbox()
 	go func() {
 		for m := range inbox { // ends when Close closes it
 			s.fromBus(m)
@@ -200,13 +307,13 @@ func (s *session) allow() bool {
 }
 
 // tend keeps the session honest while it lasts: pings the browser, ends it
-// if the bus went away, forgets unanswered requests, and re-reads the
-// person's grants — a grant revoked, or a session ended, reaches the phone.
+// if the bus went away, forgets unanswered requests, and renews the person's
+// ticket — a grant revoked, or a session ended, reaches the phone.
 func (s *session) tend(ctx context.Context) {
 	ping := time.NewTicker(pingEvery)
 	defer ping.Stop()
-	grants := time.NewTicker(grantsEvery)
-	defer grants.Stop()
+	renew := time.NewTicker(ticketEvery)
+	defer renew.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -229,10 +336,19 @@ func (s *session) tend(ctx context.Context) {
 					delete(s.pending, id)
 				}
 			}
+			lapsed := s.user != "" && time.Now().After(s.until)
+			idle := s.user == "" && time.Since(s.anonSince) > signInWithin
 			s.mu.Unlock()
-		case <-grants.C:
+			if idle {
+				s.ws.Close() // a socket held open without anyone on it is a slot taken
+				return
+			}
+			if lapsed {
+				s.drop() // the ticket ran out and could not be renewed
+			}
+		case <-renew.C:
 			if s.who() != "" {
-				s.readGrants()
+				s.renewTicket()
 			}
 		}
 	}
@@ -249,6 +365,10 @@ func (s *session) who() string {
 func (s *session) fromBrowser(m monolink.Message) {
 	if why := s.refuse(m); why != "" {
 		s.answer(m, monolink.VerbErr, monolink.CodeDenied, why)
+		return
+	}
+	if !s.rationed(m) {
+		s.answer(m, monolink.VerbErr, monolink.CodeBusy, "too many tries from here; wait a while")
 		return
 	}
 	id := busID()
@@ -282,14 +402,16 @@ func (s *session) refuse(m monolink.Message) string {
 	s.mu.Unlock()
 
 	if to.Node == marshal.Node {
-		if user != "" {
-			return "" // marshal judges its own requests
-		}
 		switch m.Verb + ":" + m.Noun {
-		case "AUTH:USER", "AUTH:PROOF", "SET:SESSION":
+		case "AUTH:CHALLENGE", "AUTH:PASSKEY", "AUTH:REDEEM", "SET:SESSION":
 			return ""
 		case "AUTH:ENROL":
 			return "the first person enrols at home"
+		case "AUTH:KEY":
+			return "a browser signs in with a passkey"
+		}
+		if user != "" {
+			return "" // marshal judges its own requests
 		}
 		return "sign in first"
 	}
@@ -297,7 +419,10 @@ func (s *session) refuse(m monolink.Message) string {
 		return "sign in first"
 	}
 	if m.Verb == monolink.VerbPing {
-		return ""
+		if to.Node != monolink.All && m.Noun == monolink.VerbPing && len(m.Args) == 0 {
+			return "" // are you there — which asks nothing else of a node
+		}
+		return "not permitted" // and the hub would refuse it
 	}
 	if to.Node == monolink.All {
 		if m.Verb == monolink.VerbGet && m.Noun == monolink.VerbReg {
@@ -309,6 +434,28 @@ func (s *session) refuse(m monolink.Message) string {
 		return "needs " + action
 	}
 	return ""
+}
+
+// rationed spends what m costs from this browser's internet address, and
+// reports whether there was enough: a challenge, or a try at an invitation.
+func (s *session) rationed(m monolink.Message) bool {
+	if s.from == nil {
+		return true
+	}
+	to, err := monolink.ParseAddress(m.To)
+	if err != nil || to.Node != marshal.Node {
+		return true
+	}
+	now := time.Now()
+	s.p.mu.Lock()
+	defer s.p.mu.Unlock()
+	switch m.Verb + ":" + m.Noun {
+	case "AUTH:CHALLENGE":
+		return s.from.challenges.take(now, challengeBurst, challengePerSec)
+	case "AUTH:REDEEM":
+		return s.from.redeems.take(now, redeemBurst, redeemPerSec)
+	}
+	return true
 }
 
 // answer replies to the browser in the name of the node it asked.
@@ -336,7 +483,10 @@ func (s *session) fromBus(m monolink.Message) {
 		if !ok {
 			return // not an answer to this browser
 		}
-		s.follow(p, m)
+		if err := s.follow(p, m); err != nil {
+			m = monolink.Message{Version: monolink.V2, From: m.From, To: m.To, Verb: monolink.VerbErr,
+				Noun: monolink.CodeState, Args: []string{err.Error()}}
+		}
 		m.ID = p.browserID
 		s.toBrowser(m)
 
@@ -366,68 +516,97 @@ func (s *session) fromBus(m monolink.Message) {
 // follow watches marshal's answers about this session. A session opened or
 // kept puts the person's name on everything sent from here on, and their
 // grants in force; one ended or refused takes both off.
-func (s *session) follow(p pending, m monolink.Message) {
+//
+// It returns an error when a session marshal opened could not be taken up
+// here: the browser is then told so, rather than that it is signed in.
+func (s *session) follow(p pending, m monolink.Message) error {
 	from, err := monolink.ParseAddress(m.From)
 	if err != nil || from.Node != marshal.Node {
-		return
+		return nil
 	}
 	asked := p.verb + ":" + p.noun
 	switch {
 	case m.Verb == monolink.VerbOK && m.Noun == marshal.NounSession && len(m.Args) == 3 &&
-		(asked == "AUTH:PROOF" || asked == "SET:SESSION"):
+		(asked == "AUTH:PASSKEY" || asked == "AUTH:REDEEM" || asked == "SET:SESSION"):
 		if marshal.ValidName(m.Args[1]) {
-			s.adopt(m.Args[1])
+			return s.adopt(m.Args[1], m.Args[0])
 		}
 	case asked == "STOP:SESSION" && m.Verb == monolink.VerbOK,
 		asked == "SET:SESSION" && m.Verb == monolink.VerbErr:
 		s.drop()
 	}
+	return nil
 }
 
-// adopt signs the person in here. Their grants are read before the browser
-// hears it is signed in, so its next request is already judged by them.
-func (s *session) adopt(user string) {
+// adopt signs the person in here. marshal's ticket for their session goes to
+// the hub first, so the connection may act for them before the browser hears
+// it is signed in; their grants are the ticket's.
+func (s *session) adopt(user, token string) error {
+	t, err := s.ticket(token)
+	if err == nil && t.Person != user {
+		err = fmt.Errorf("a ticket for %s", t.Person)
+	}
+	if err != nil {
+		s.drop()
+		slog.Warn("no ticket", "user", user, "err", err)
+		return errors.New("signed in, but the hub did not take the ticket")
+	}
 	s.mu.Lock()
-	s.user, s.grants = user, nil
+	s.user, s.token, s.grants, s.until = user, token, t.Grants, t.Expires
 	s.mu.Unlock()
 	if err := s.bus.SetActor(user); err != nil {
 		s.drop()
-		return
+		return err
 	}
-	s.readGrants()
 	slog.Info("signed in", "user", user)
+	return nil
 }
 
-func (s *session) drop() {
-	s.mu.Lock()
-	was := s.user
-	s.user, s.grants = "", nil
-	s.mu.Unlock()
-	s.bus.SetActor("")
-	if was != "" {
-		slog.Info("signed out", "user", was)
-	}
-}
-
-// readGrants asks marshal what the person may do. A refusal means their
-// session has gone — ended elsewhere, or expired — and they are signed out.
-func (s *session) readGrants() {
-	user := s.who()
+func (s *session) ticket(token string) (marshal.Ticket, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), askTimeout)
 	defer cancel()
-	g, err := marshal.Grants(ctx, s.bus, user)
+	return marshal.Ticketed(ctx, s.bus, token)
+}
+
+// renewTicket asks for a fresh ticket well before the one at the hub runs
+// out. A refusal means the session has gone — ended, expired, its key
+// removed, its person removed — and they are signed out here too.
+func (s *session) renewTicket() {
+	s.mu.Lock()
+	user, token := s.user, s.token
+	s.mu.Unlock()
+	t, err := s.ticket(token)
 	var re *monolink.ReplyError
 	switch {
 	case errors.As(err, &re):
 		s.drop()
 	case err != nil:
-		slog.Warn("grants unread", "user", user, "err", err) // keep what we had
+		slog.Warn("ticket not renewed", "user", user, "err", err) // the old one runs out by itself
 	default:
 		s.mu.Lock()
 		if s.user == user {
-			s.grants = g
+			s.grants, s.until = t.Grants, t.Expires
 		}
 		s.mu.Unlock()
+	}
+}
+
+func (s *session) drop() {
+	s.mu.Lock()
+	was := s.user
+	s.user, s.token, s.grants, s.until = "", "", nil, time.Time{}
+	if was != "" {
+		s.anonSince = time.Now()
+	}
+	s.mu.Unlock()
+	s.bus.SetActor("")
+	if was != "" {
+		go func() { // take the ticket off at the hub too; the connection may already be gone
+			ctx, cancel := context.WithTimeout(context.Background(), askTimeout)
+			defer cancel()
+			marshal.DropTicket(ctx, s.bus)
+		}()
+		slog.Info("signed out", "user", was)
 	}
 }
 

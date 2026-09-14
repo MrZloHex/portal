@@ -1,6 +1,8 @@
 package portal
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"io"
 	stdlog "log"
 	"net/http"
@@ -99,15 +101,17 @@ func (b *bus) node(t *testing.T, name string) *monolink.Client {
 
 // ─── a marshal that knows one person, dasha, allowed VERTEX.* ────────
 
-const secret = "pa55word"
+// dashasPhone is the one passkey the fake marshal knows. It checks nothing
+// else of an assertion: that is marshal's to do, and marshal's tests'.
+const dashasPhone = "dashas-phone"
+
+// invitation is the one code it takes up, for anybody.
+const invitation = "GOOD-CODE"
+
+var _, ticketKey, _ = ed25519.GenerateKey(rand.Reader)
 
 func fakeMarshal(t *testing.T, b *bus) {
 	t.Helper()
-	kdf, err := marshal.NewKDF()
-	if err != nil {
-		t.Fatal(err)
-	}
-	verifier := kdf.Verifier(secret)
 	var mu sync.Mutex
 	nonces := map[string]string{}   // nonce -> panel
 	sessions := map[string]string{} // token -> user
@@ -122,21 +126,29 @@ func fakeMarshal(t *testing.T, b *bus) {
 		mu.Lock()
 		defer mu.Unlock()
 		switch m.Verb + ":" + m.Noun {
-		case "AUTH:USER":
+		case "AUTH:CHALLENGE":
 			n := busID()
 			nonces[n] = from.Node
-			r.Reply(monolink.VerbOK, marshal.NounChallenge, kdf.String(), n)
-		case "AUTH:PROOF":
-			name, n, proof := m.Args[0], m.Args[1], m.Args[2]
+			r.Reply(monolink.VerbOK, marshal.NounChallenge, n)
+		case "AUTH:PASSKEY":
+			n, cred := m.Args[0], m.Args[1]
 			panel, ok := nonces[n]
 			delete(nonces, n)
-			if !ok || name != "dasha" || !marshal.CheckProof(verifier, name, panel, n, proof) {
+			if !ok || panel != from.Node || cred != dashasPhone {
 				r.Reply(monolink.VerbErr, monolink.CodeDenied)
 				return
 			}
 			tok := "tok" + n
-			sessions[tok] = name
-			r.Reply(monolink.VerbOK, marshal.NounSession, tok, name, time.Now().Add(time.Hour).Format(time.RFC3339))
+			sessions[tok] = "dasha"
+			r.Reply(monolink.VerbOK, marshal.NounSession, tok, "dasha", time.Now().Add(time.Hour).Format(time.RFC3339))
+		case "AUTH:REDEEM":
+			if m.Args[0] != invitation {
+				r.Reply(monolink.VerbErr, monolink.CodeDenied)
+				return
+			}
+			tok := "tok" + busID()
+			sessions[tok] = m.Args[1]
+			r.Reply(monolink.VerbOK, marshal.NounSession, tok, m.Args[1], time.Now().Add(time.Hour).Format(time.RFC3339))
 		case "SET:SESSION":
 			if u, ok := sessions[m.Args[0]]; ok {
 				r.Reply(monolink.VerbOK, marshal.NounSession, m.Args[0], u, time.Now().Add(time.Hour).Format(time.RFC3339))
@@ -146,6 +158,14 @@ func fakeMarshal(t *testing.T, b *bus) {
 		case "STOP:SESSION":
 			delete(sessions, m.Args[0])
 			r.Reply(monolink.VerbOK, marshal.NounSession, m.Args[0], "dasha", time.Now().Format(time.RFC3339))
+		case "GET:TICKET":
+			if u, ok := sessions[m.Args[0]]; ok {
+				tk := marshal.Ticket{Person: u, Panel: from.Node, Expires: time.Now().Add(marshal.TicketTTL),
+					Grants: []string{"VERTEX.*"}}.Sign(ticketKey)
+				r.Reply(monolink.VerbOK, marshal.NounTicket, tk.Args()...)
+			} else {
+				r.Reply(monolink.VerbErr, monolink.CodeNAC)
+			}
 		case "GET:GRANTS":
 			if from.Actor == "dasha" && len(sessions) > 0 {
 				r.Reply(monolink.VerbOK, marshal.NounGrants, "VERTEX.*")
@@ -155,6 +175,28 @@ func fakeMarshal(t *testing.T, b *bus) {
 		}
 	})
 	if err := c.Connect(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// and the hub's part in signing in: it takes the ticket
+	h := b.node(t, marshal.Hub)
+	h.Handle("*", func(r *monolink.Request) {
+		m := r.Msg
+		if m.To != marshal.Hub || m.Version != monolink.V2 {
+			return
+		}
+		switch m.Verb + ":" + m.Noun {
+		case "SET:TICKET":
+			if _, err := marshal.ParseTicket(m.Args); err != nil {
+				r.Reply(monolink.VerbErr, monolink.CodeArg)
+				return
+			}
+			r.Reply(monolink.VerbOK, marshal.NounTicket)
+		case "STOP:TICKET":
+			r.Reply(monolink.VerbOK, marshal.NounTicket)
+		}
+	})
+	if err := h.Connect(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -255,20 +297,16 @@ func id(want string) func(monolink.Message) bool {
 	return func(m monolink.Message) bool { return m.ID == want }
 }
 
-// signIn goes through the challenge exactly as the app will.
-func (br *browser) signIn(name, secret string) monolink.Message {
+// signIn goes through the challenge as the app will, answering it with the
+// passkey cred.
+func (br *browser) signIn(cred string) monolink.Message {
 	br.t.Helper()
-	br.send("2:c1:X:MARSHAL:AUTH:USER:" + name)
+	br.send("2:c1:X:MARSHAL:AUTH:CHALLENGE")
 	ch := br.expect(id("c1"))
 	if ch.Noun != marshal.NounChallenge {
 		br.t.Fatalf("challenge: %+v", ch)
 	}
-	kdf, err := marshal.ParseKDF(ch.Args[0])
-	if err != nil {
-		br.t.Fatal(err)
-	}
-	proof := marshal.Proof(kdf.Verifier(secret), name, Panel, ch.Args[1])
-	br.send("2:c2:X:MARSHAL:AUTH:PROOF:" + name + ":" + ch.Args[1] + ":" + proof)
+	br.send("2:c2:X:MARSHAL:AUTH:PASSKEY:" + ch.Args[0] + ":" + cred + ":AUTHDATA:SIGNATURE:CLIENTDATA")
 	return br.expect(id("c2"))
 }
 
@@ -284,12 +322,21 @@ func TestAnonymousMayOnlySignIn(t *testing.T) {
 	if m := br.expect(id("a1")); m.Verb != monolink.VerbErr || m.Noun != monolink.CodeDenied {
 		t.Fatalf("anonymous SET answered %+v", m)
 	}
-	br.send("2:a2:X:MARSHAL:AUTH:ENROL:CODE:eve:k:v")
+	br.send("2:a2:X:MARSHAL:AUTH:ENROL:CODE:eve:ed25519:id:-8:key")
 	if m := br.expect(id("a2")); m.Noun != monolink.CodeDenied {
 		t.Fatalf("enrolment through portal answered %+v", m)
 	}
+	br.send("2:a3:X:MARSHAL:AUTH:KEY:nonce:mzh:id:sig")
+	if m := br.expect(id("a3")); m.Noun != monolink.CodeDenied {
+		t.Fatalf("a panel's key through portal answered %+v", m)
+	}
+	br.send("2:a4:X:MARSHAL:GET:USERS")
+	if m := br.expect(id("a4")); m.Noun != monolink.CodeDenied {
+		t.Fatalf("an anonymous GET:USERS answered %+v", m)
+	}
 	for _, f := range b.relayed() {
-		if strings.Contains(f, ":SET:LAMP.STATE") || strings.Contains(f, ":AUTH:ENROL") {
+		if strings.Contains(f, ":SET:LAMP.STATE") || strings.Contains(f, ":AUTH:ENROL") ||
+			strings.Contains(f, ":AUTH:KEY") || strings.Contains(f, ":GET:USERS") {
 			t.Fatalf("reached the bus: %q", f)
 		}
 	}
@@ -301,7 +348,7 @@ func TestSignInThenGrantsDecide(t *testing.T) {
 	fakeVertex(t, b)
 	br := connect(t, openPortal(t, b))
 
-	if s := br.signIn("dasha", secret); s.Noun != marshal.NounSession || s.Args[1] != "dasha" {
+	if s := br.signIn(dashasPhone); s.Noun != marshal.NounSession || s.Args[1] != "dasha" {
 		t.Fatalf("sign in answered %+v", s)
 	}
 	br.send("2:s1:X:VERTEX:SET:LAMP.STATE:ON")
@@ -316,18 +363,37 @@ func TestSignInThenGrantsDecide(t *testing.T) {
 	}
 }
 
-func TestWrongSecretSignsNobodyIn(t *testing.T) {
+func TestAStrangersPasskeySignsNobodyIn(t *testing.T) {
 	b := newBus(t)
 	fakeMarshal(t, b)
 	fakeVertex(t, b)
 	br := connect(t, openPortal(t, b))
-	if m := br.signIn("dasha", "wrong"); m.Verb != monolink.VerbErr {
-		t.Fatalf("wrong secret answered %+v", m)
+	if m := br.signIn("a-strangers-passkey"); m.Verb != monolink.VerbErr {
+		t.Fatalf("a stranger's passkey answered %+v", m)
 	}
 	br.send("2:w1:X:VERTEX:SET:LAMP.STATE:ON")
 	if m := br.expect(id("w1")); m.Noun != monolink.CodeDenied {
-		t.Fatalf("after a wrong secret, SET answered %+v", m)
+		t.Fatalf("after a refused passkey, SET answered %+v", m)
 	}
+}
+
+// Taking up an invitation signs the new person in, as signing in does.
+func TestAnInvitationSignsIn(t *testing.T) {
+	b := newBus(t)
+	fakeMarshal(t, b)
+	fakeVertex(t, b)
+	br := connect(t, openPortal(t, b))
+	br.send("2:r1:X:MARSHAL:AUTH:REDEEM:WRONG-CODE:olga:webauthn:id:-7:key")
+	if m := br.expect(id("r1")); m.Verb != monolink.VerbErr {
+		t.Fatalf("a wrong code answered %+v", m)
+	}
+	br.send("2:r2:X:MARSHAL:AUTH:REDEEM:" + invitation + ":olga:webauthn:id:-7:key")
+	if m := br.expect(id("r2")); m.Noun != marshal.NounSession || m.Arg(1) != "olga" {
+		t.Fatalf("the invitation answered %+v", m)
+	}
+	br.send("2:r3:X:VERTEX:SET:LAMP.STATE:ON")
+	br.expect(id("r3"))
+	b.waitFrame(t, func(f string) bool { return strings.Contains(f, ":MONOWEB.olga:VERTEX:SET:LAMP.STATE:ON") })
 }
 
 // Whatever sender a browser writes, the bus sees the one portal gives it.
@@ -336,7 +402,7 @@ func TestBrowserCannotChooseWhoItIs(t *testing.T) {
 	fakeMarshal(t, b)
 	fakeVertex(t, b)
 	br := connect(t, openPortal(t, b))
-	br.signIn("dasha", secret)
+	br.signIn(dashasPhone)
 	br.send("2:f1:MONOVIEW.mzh:VERTEX:SET:LAMP.STATE:OFF")
 	br.expect(id("f1"))
 	for _, f := range b.relayed() {
@@ -359,7 +425,7 @@ func TestFramesReachTheBrowserInOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	br := connect(t, openPortal(t, b))
-	br.signIn("dasha", secret)
+	br.signIn(dashasPhone)
 
 	const sent = 300
 	go func() {
@@ -385,8 +451,8 @@ func TestAnswersGoOnlyToWhoAsked(t *testing.T) {
 	fakeVertex(t, b)
 	url := openPortal(t, b)
 	a, other := connect(t, url), connect(t, url)
-	other.send("2:c2:X:MARSHAL:AUTH:USER:ghost") // the same id a is about to use
-	a.signIn("dasha", secret)
+	other.send("2:c2:X:MARSHAL:AUTH:CHALLENGE") // the same id a is about to use
+	a.signIn(dashasPhone)
 	if !other.nothing(func(f string) bool { return strings.Contains(f, ":SESSION:") }) {
 		t.Fatal("another browser was given the session")
 	}
@@ -403,7 +469,7 @@ func TestAnnouncementsFollowGrants(t *testing.T) {
 		t.Fatal("an anonymous browser heard an announcement")
 	}
 
-	br.signIn("dasha", secret)
+	br.signIn(dashasPhone)
 	lamp.Set("OFF")
 	br.expect(func(m monolink.Message) bool {
 		return m.Verb == monolink.VerbPub && m.Noun == "LAMP.STATE" && m.Arg(0) == "OFF"
@@ -424,7 +490,7 @@ func TestSignOutTakesTheNameOff(t *testing.T) {
 	fakeMarshal(t, b)
 	fakeVertex(t, b)
 	br := connect(t, openPortal(t, b))
-	s := br.signIn("dasha", secret)
+	s := br.signIn(dashasPhone)
 	br.send("2:o1:X:MARSHAL:STOP:SESSION:" + s.Args[0])
 	br.expect(id("o1"))
 	br.send("2:o2:X:VERTEX:SET:LAMP.STATE:ON")
