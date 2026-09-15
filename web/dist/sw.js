@@ -36,3 +36,27 @@ self.addEventListener('fetch', (e) => {
       .catch(() => caches.match(e.request).then((hit) => hit || caches.match('/'))),
   )
 })
+
+// A push from vestnik: shown whether the app is open or not. It names no one
+// and says nothing of what was written — a lock screen shows it; the app,
+// opened, shows the rest.
+self.addEventListener('push', (e) => {
+  let n = { title: 'MONOLITH', body: 'something new', tag: 'monolith' }
+  try {
+    n = { ...n, ...e.data.json() }
+  } catch {
+    // shown as it is
+  }
+  e.waitUntil(self.registration.showNotification(n.title, { body: n.body, tag: n.tag, icon: '/icon-192.png', badge: '/icon-192.png' }))
+})
+
+// Tapped: to the app, already open or not.
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close()
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((open) => {
+      const app = open.find((c) => new URL(c.url).origin === location.origin)
+      return app ? app.focus() : self.clients.openWindow('/')
+    }),
+  )
+})

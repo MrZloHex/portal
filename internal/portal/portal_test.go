@@ -108,6 +108,9 @@ const dashasPhone = "dashas-phone"
 // invitation is the one code it takes up, for anybody.
 const invitation = "GOOD-CODE"
 
+// linkAsks is what portal passes on of each AUTH:LINK.
+var linkAsks = make(chan []string, 8)
+
 var _, ticketKey, _ = ed25519.GenerateKey(rand.Reader)
 
 func fakeMarshal(t *testing.T, b *bus) {
@@ -166,6 +169,17 @@ func fakeMarshal(t *testing.T, b *bus) {
 			} else {
 				r.Reply(monolink.VerbErr, monolink.CodeNAC)
 			}
+		case "AUTH:LINK":
+			linkAsks <- append([]string(nil), m.Args...)
+			r.Reply(monolink.VerbOK, "LINK", "the-secret", "ABCD-EFGH", time.Now().Add(2*time.Minute).Format(time.RFC3339))
+		case "AUTH:LINKED":
+			if len(m.Args) == 1 {
+				r.Reply(monolink.VerbOK, "LINKED", "READY")
+				return
+			}
+			tok := "tok" + busID()
+			sessions[tok] = "dasha"
+			r.Reply(monolink.VerbOK, marshal.NounSession, tok, "dasha", time.Now().Add(time.Hour).Format(time.RFC3339))
 		case "GET:GRANTS":
 			if from.Actor == "dasha" && len(sessions) > 0 {
 				r.Reply(monolink.VerbOK, marshal.NounGrants, "VERTEX.*")
@@ -505,5 +519,38 @@ func TestCrossSitePagesAreRefused(t *testing.T) {
 	_, resp, err := websocket.DefaultDialer.Dial(url, http.Header{"Origin": {"https://evil.example"}})
 	if err == nil || resp == nil || resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("a page on another site opened a socket: %v", err)
+	}
+}
+
+// A browser another device signs in: it may ask before anyone is signed in
+// there; where it asked from is portal's to say, over what it claimed; and
+// the session it collects signs it in, the ticket at the hub first.
+func TestABrowserApprovedFromAnotherDeviceIsSignedIn(t *testing.T) {
+	b := newBus(t)
+	fakeMarshal(t, b)
+	fakeVertex(t, b)
+	br := connect(t, openPortal(t, b))
+
+	br.send("2:l1:X:MARSHAL:AUTH:LINK:KEY:firefox:the-moon")
+	if r := br.expect(id("l1")); r.Verb != monolink.VerbOK || r.Noun != "LINK" {
+		t.Fatalf("asking: %+v", r)
+	}
+	select {
+	case got := <-linkAsks:
+		if len(got) != 3 || got[0] != "KEY" || got[1] != "firefox" || got[2] != "home" {
+			t.Fatalf("portal passed on %q: where a browser asks from is portal's to say", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("marshal was never asked")
+	}
+	br.send("2:l2:X:MARSHAL:AUTH:LINKED:the-secret")
+	br.expect(id("l2"))
+	br.send("2:l3:X:MARSHAL:AUTH:LINKED:the-secret:NONCE:SIG")
+	if r := br.expect(id("l3")); r.Noun != marshal.NounSession {
+		t.Fatalf("collecting: %+v", r)
+	}
+	br.send("2:v1:X:VERTEX:GET:LAMP.STATE")
+	if r := br.expect(id("v1")); r.Verb != monolink.VerbOK {
+		t.Fatalf("not signed in after collecting: %+v", r)
 	}
 }

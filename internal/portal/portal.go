@@ -63,6 +63,8 @@ const (
 	challengePerSec = 1.0 / 6         // and then ten a minute
 	redeemBurst     = 5               // AUTH:REDEEM from one address at once
 	redeemPerSec    = 1.0 / 180       // and then one every three minutes
+	linkBurst       = 5               // AUTH:LINK from one address at once: a sign-in another device approves
+	linkPerSec      = 1.0 / 30        // and then two a minute
 	maxVisitors     = 4096            // addresses remembered
 	visitorTTL      = 30 * time.Minute
 )
@@ -90,6 +92,7 @@ type visitor struct {
 	seen       time.Time // when its last socket closed
 	challenges bucket
 	redeems    bucket
+	links      bucket
 }
 
 // bucket is an allowance that refills: burst at once, then perSec.
@@ -131,6 +134,15 @@ func visitorKey(r *http.Request) string {
 		return p.String()
 	}
 	return a.String()
+}
+
+// whereFrom is where a browser is, as a sign-in another device approves
+// shows it: "home" for the house's own network, or its internet address.
+func whereFrom(key string) string {
+	if key == "" {
+		return "home"
+	}
+	return key
 }
 
 // visitor is key's, made if need be; nil when too many are remembered. Call
@@ -210,7 +222,7 @@ func (p *Portal) ServeBus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	s := &session{p: p, ws: ws, from: v, pending: map[string]pending{}, tokens: rateBurst, filled: now, anonSince: now}
+	s := &session{p: p, ws: ws, from: v, where: whereFrom(key), pending: map[string]pending{}, tokens: rateBurst, filled: now, anonSince: now}
 	s.run(r.Context())
 }
 
@@ -223,11 +235,12 @@ type pending struct {
 }
 
 type session struct {
-	p    *Portal
-	ws   *websocket.Conn
-	wmu  sync.Mutex
-	bus  *monolink.Client
-	from *visitor // nil from the home network
+	p     *Portal
+	ws    *websocket.Conn
+	wmu   sync.Mutex
+	bus   *monolink.Client
+	from  *visitor // nil from the home network
+	where string   // where the browser is, as portal tells marshal: "home", or its internet address
 
 	mu        sync.Mutex
 	user      string
@@ -371,6 +384,12 @@ func (s *session) fromBrowser(m monolink.Message) {
 		s.answer(m, monolink.VerbErr, monolink.CodeBusy, "too many tries from here; wait a while")
 		return
 	}
+	args := m.Args
+	if to, _ := monolink.ParseAddress(m.To); to.Node == marshal.Node && m.Verb+":"+m.Noun == "AUTH:LINK" && len(args) >= 2 {
+		// Where a browser asks from is portal's to say, never its own: it is
+		// what the approving device shows the person.
+		args = append(args[:2:2], s.where)
+	}
 	id := busID()
 	if m.To != monolink.All { // a roll call is answered by announcing, not by a reply
 		s.mu.Lock()
@@ -378,7 +397,7 @@ func (s *session) fromBrowser(m monolink.Message) {
 		s.mu.Unlock()
 	}
 	out := monolink.Message{Version: monolink.V2, ID: id, From: s.bus.Address(),
-		To: m.To, Verb: m.Verb, Noun: m.Noun, Args: m.Args}
+		To: m.To, Verb: m.Verb, Noun: m.Noun, Args: args}
 	if err := s.bus.SendMessage(out); err != nil {
 		s.mu.Lock()
 		delete(s.pending, id)
@@ -403,7 +422,7 @@ func (s *session) refuse(m monolink.Message) string {
 
 	if to.Node == marshal.Node {
 		switch m.Verb + ":" + m.Noun {
-		case "AUTH:CHALLENGE", "AUTH:PASSKEY", "AUTH:REDEEM", "SET:SESSION":
+		case "AUTH:CHALLENGE", "AUTH:PASSKEY", "AUTH:REDEEM", "SET:SESSION", "AUTH:LINK", "AUTH:LINKED":
 			return ""
 		case "AUTH:ENROL":
 			return "the first person enrols at home"
@@ -454,6 +473,8 @@ func (s *session) rationed(m monolink.Message) bool {
 		return s.from.challenges.take(now, challengeBurst, challengePerSec)
 	case "AUTH:REDEEM":
 		return s.from.redeems.take(now, redeemBurst, redeemPerSec)
+	case "AUTH:LINK":
+		return s.from.links.take(now, linkBurst, linkPerSec)
 	}
 	return true
 }
@@ -527,7 +548,7 @@ func (s *session) follow(p pending, m monolink.Message) error {
 	asked := p.verb + ":" + p.noun
 	switch {
 	case m.Verb == monolink.VerbOK && m.Noun == marshal.NounSession && len(m.Args) == 3 &&
-		(asked == "AUTH:PASSKEY" || asked == "AUTH:REDEEM" || asked == "SET:SESSION"):
+		(asked == "AUTH:PASSKEY" || asked == "AUTH:REDEEM" || asked == "SET:SESSION" || asked == "AUTH:LINKED"):
 		if marshal.ValidName(m.Args[1]) {
 			return s.adopt(m.Args[1], m.Args[0])
 		}
